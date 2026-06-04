@@ -1,0 +1,27 @@
+# Core scientific stack
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Medical imaging
+nibabel>=5.0.0          # NIfTI/MRI file I/O
+nilearn>=0.10.0         # Brain imaging + atlas access
+antspyx>=0.4.0          # ANTs registration (Python wrapper)
+SimpleITK>=2.3.0        # Image processing fallback
+
+# Deep learning segmentation (optional – BrainSegFounder)
+torch>=2.0.0
+monai>=1.3.0            # Medical segmentation toolkit
+
+# LLM API
+openai>=1.30.0          # GPT-4o / GPT-5
+
+# Visualization & reporting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0

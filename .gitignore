@@ -1,0 +1,36 @@
+# Virtual environment
+.venv/
+
+# API keys — never commit
+.env
+*.env
+
+# Pipeline outputs (generated data, not source)
+results/
+data/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# nilearn / numpy cache
+nilearn_data/
+*.npy
+*.npz
+
+# NIfTI / medical imaging files (large binaries)
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.dcm
+
+# OS
+.DS_Store
+Thumbs.db
