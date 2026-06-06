@@ -270,9 +270,12 @@ def test_main_dry_run_creates_predictions_csv(tmp_path):
         timeout=120,
     )
     assert result.returncode == 0, result.stderr[-1000:]
-    preds_csv = tmp_path / "predictions.csv"
+    run_dirs = list((tmp_path / "runs").glob("*/"))
+    assert run_dirs, "runs/ subdirectory should be created"
+    run_dir = run_dirs[0]
+    preds_csv = run_dir / "predictions.csv"
     assert preds_csv.exists(), "predictions.csv should be created"
-    traces_txt = tmp_path / "reasoning_traces.txt"
+    traces_txt = run_dir / "reasoning_traces.txt"
     assert traces_txt.exists(), "reasoning_traces.txt should be created"
     trace_lines = traces_txt.read_text(encoding="utf-8").splitlines()
     assert len(trace_lines) == 6, f"Expected 6 trace lines, got {len(trace_lines)}"
@@ -281,7 +284,7 @@ def test_main_dry_run_creates_predictions_csv(tmp_path):
     lines = preds_csv.read_text().splitlines()
     assert len(lines) == 7, f"Expected header + 6 rows, got {len(lines)}"
 
-    metrics_json = tmp_path / "metrics.json"
+    metrics_json = run_dir / "metrics.json"
     assert metrics_json.exists(), "metrics.json should be created"
     m = json.loads(metrics_json.read_text())
     assert m["n_total"] == 6

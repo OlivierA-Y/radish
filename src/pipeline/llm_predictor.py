@@ -11,6 +11,8 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -29,8 +31,8 @@ OPENAI_MODEL_ALIASES: Dict[str, str] = {
 # Convenience aliases for popular OpenRouter models
 OPENROUTER_MODEL_ALIASES: Dict[str, str] = {
     "claude-opus-4":        "anthropic/claude-opus-4",
-    "claude-sonnet-4-5":    "anthropic/claude-sonnet-4-5",
-    "claude-haiku-4-5":     "anthropic/claude-haiku-4-5-20251001",
+    "claude-sonnet-4-5":    "anthropic/claude-sonnet-4.5",
+    "claude-haiku-4-5":     "anthropic/claude-haiku-4.5",
     "gemini-pro":           "google/gemini-pro-1.5",
     "gemini-flash":         "google/gemini-flash-1.5",
     "llama-70b":            "meta-llama/llama-3.3-70b-instruct",
@@ -71,6 +73,15 @@ class IDHPrediction:
     raw_response: str
     latency_s: float
     ground_truth: Optional[int] = None    # 1 = mutant, 0 = wildtype
+    # Structured rationale fields (Change 1)
+    decisive_feature: Optional[str] = None
+    supporting_features: Optional[List[str]] = None
+    contradicting_features: Optional[List[str]] = None
+    findings: Optional[str] = None
+    impression: Optional[str] = None
+    phantom_citations: Optional[List[str]] = None
+    # Determinism tracking (Change 4)
+    model_version: Optional[str] = None
     correct: Optional[bool] = field(default=None, init=False)
 
     def __post_init__(self):
@@ -86,8 +97,19 @@ class IDHPrediction:
     def confidence_score(self) -> float:
         return {"high": 0.9, "medium": 0.65, "low": 0.4}.get(self.confidence.lower(), 0.5)
 
+    def cited_identifiers(self) -> List[str]:
+        """Return all feature identifiers cited in the structured rationale."""
+        cited: List[str] = []
+        if self.decisive_feature:
+            cited.append(self.decisive_feature)
+        if self.supporting_features:
+            cited.extend(self.supporting_features)
+        if self.contradicting_features:
+            cited.extend(self.contradicting_features)
+        return cited
 
-def _parse_response(text: str) -> Dict[str, str]:
+
+def _parse_response(text: str) -> Dict:
     """Extract JSON from LLM response (handles markdown code fences)."""
     # Strip markdown fences
     cleaned = re.sub(r"```(?:json)?", "", text).strip("`").strip()
@@ -95,7 +117,12 @@ def _parse_response(text: str) -> Dict[str, str]:
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group())
+            parsed = json.loads(match.group())
+            # Ensure list fields are lists, not None
+            for list_field in ("supporting_features", "contradicting_features"):
+                if parsed.get(list_field) is None:
+                    parsed[list_field] = []
+            return parsed
         except json.JSONDecodeError:
             pass
     # Fallback: regex field extraction
@@ -106,7 +133,34 @@ def _parse_response(text: str) -> Dict[str, str]:
     confidence = conf_match.group(1) if conf_match else "low"
     reason_match = re.search(r'"reasoning"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
     reasoning = reason_match.group(1) if reason_match else text[:300]
-    return {"idh_status": idh, "confidence": confidence, "reasoning": reasoning}
+    return {
+        "idh_status": idh,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "decisive_feature": None,
+        "supporting_features": [],
+        "contradicting_features": [],
+        "findings": None,
+        "impression": None,
+    }
+
+
+def _compute_phantom_citations(
+    decisive: Optional[str],
+    supporting: Optional[List[str]],
+    contradicting: Optional[List[str]],
+    vocabulary: Optional[List[str]],
+) -> List[str]:
+    """Return cited feature names not present in the feature vocabulary."""
+    if not vocabulary:
+        return []
+    vocab_set = set(vocabulary)
+    cited: List[str] = []
+    if decisive:
+        cited.append(decisive)
+    cited.extend(supporting or [])
+    cited.extend(contradicting or [])
+    return [c for c in cited if c and c not in vocab_set]
 
 
 def _load_env_key(var_name: str) -> Optional[str]:
@@ -135,6 +189,8 @@ class LLMPredictor:
 
     Auto-detection: if model contains '/' (e.g. 'anthropic/claude-opus-4'),
     the provider defaults to 'openrouter' even if not specified.
+
+    seed=<int> pins the random seed for determinism (Change 4).
     """
 
     def __init__(
@@ -142,11 +198,13 @@ class LLMPredictor:
         model: str = DEFAULT_MODEL,
         provider: Optional[str] = None,
         temperature: float = 0.0,
-        max_tokens: int = 512,
+        max_tokens: int = 1024,
         max_retries: int = 3,
         retry_delay_s: float = 2.0,
         http_referer: str = "https://github.com/idh-llm-pipeline",
         app_title: str = "IDH-LLM-Pipeline",
+        log_path: Optional[str | Path] = None,
+        seed: Optional[int] = 42,
     ):
         self.provider       = _infer_provider(model, provider)
         self.model          = _resolve_model(model, self.provider)
@@ -156,6 +214,8 @@ class LLMPredictor:
         self.retry_delay_s  = retry_delay_s
         self.http_referer   = http_referer
         self.app_title      = app_title
+        self.log_path       = Path(log_path) if log_path else None
+        self.seed           = seed
         self._client        = None
 
     def _get_client(self):
@@ -195,17 +255,46 @@ class LLMPredictor:
 
         return self._client
 
+    def _append_log(self, entry: Dict) -> None:
+        if self.log_path is None:
+            return
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def raw_query(self, messages: List[Dict]) -> str:
+        """Make a direct API call and return the raw response string."""
+        client = self._get_client()
+        kwargs: Dict = dict(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
     def predict(
         self,
         subject_id: str,
         narrative: str,
         ground_truth: Optional[int] = None,
+        features_dict: Optional[Dict] = None,
+        clinical_dict: Optional[Dict] = None,
         system_prompt: Optional[str] = None,
         user_prompt_template: Optional[str] = None,
     ) -> IDHPrediction:
         from src.prompts.templates import build_prompt
+        from src.pipeline.interventions import extract_feature_vocabulary
 
-        sys_p, usr_p = build_prompt(narrative)
+        # Build feature vocabulary from features dict (Change 1)
+        feature_vocabulary: Optional[List[str]] = None
+        if features_dict is not None:
+            feature_vocabulary = extract_feature_vocabulary(features_dict, clinical=clinical_dict)
+
+        sys_p, usr_p = build_prompt(narrative, feature_vocabulary=feature_vocabulary)
         if system_prompt:
             sys_p = system_prompt
         if user_prompt_template:
@@ -221,16 +310,31 @@ class LLMPredictor:
         for attempt in range(1, self.max_retries + 1):
             try:
                 t0 = time.perf_counter()
-                response = client.chat.completions.create(
+                kwargs: Dict = dict(
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
+                if self.seed is not None:
+                    kwargs["seed"] = self.seed
+                response = client.chat.completions.create(**kwargs)
                 latency = time.perf_counter() - t0
                 raw = response.choices[0].message.content or ""
                 parsed = _parse_response(raw)
-                return IDHPrediction(
+
+                # Compute phantom citations (Change 1)
+                phantom = _compute_phantom_citations(
+                    decisive=parsed.get("decisive_feature"),
+                    supporting=parsed.get("supporting_features"),
+                    contradicting=parsed.get("contradicting_features"),
+                    vocabulary=feature_vocabulary,
+                )
+
+                # Capture actual model version from API response (Change 4)
+                model_version = getattr(response, "model", self.model)
+
+                prediction = IDHPrediction(
                     subject_id=subject_id,
                     model=self.model,
                     idh_status=parsed.get("idh_status", "IDH-wildtype"),
@@ -239,7 +343,28 @@ class LLMPredictor:
                     raw_response=raw,
                     latency_s=latency,
                     ground_truth=ground_truth,
+                    decisive_feature=parsed.get("decisive_feature"),
+                    supporting_features=parsed.get("supporting_features") or [],
+                    contradicting_features=parsed.get("contradicting_features") or [],
+                    findings=parsed.get("findings"),
+                    impression=parsed.get("impression"),
+                    phantom_citations=phantom,
+                    model_version=model_version,
                 )
+                self._append_log({
+                    "timestamp":     datetime.now(timezone.utc).isoformat(),
+                    "subject_id":    subject_id,
+                    "model":         self.model,
+                    "model_version": model_version,
+                    "seed":          self.seed,
+                    "system_prompt": sys_p,
+                    "user_prompt":   usr_p,
+                    "raw_response":  raw,
+                    "parsed":        parsed,
+                    "latency_s":     latency,
+                    "phantom_citations": phantom,
+                })
+                return prediction
             except Exception as e:
                 last_err = e
                 logger.warning(
@@ -256,7 +381,8 @@ class LLMPredictor:
         delay_between_s: float = 0.5,
     ) -> List[IDHPrediction]:
         """
-        subjects: list of dicts with keys: subject_id, narrative, ground_truth (optional)
+        subjects: list of dicts with keys: subject_id, narrative, ground_truth (optional),
+                  features_dict (optional)
         """
         results = []
         for i, subj in enumerate(subjects):
@@ -268,6 +394,7 @@ class LLMPredictor:
                 subject_id=subj["subject_id"],
                 narrative=subj["narrative"],
                 ground_truth=subj.get("ground_truth"),
+                features_dict=subj.get("features_dict"),
             )
             results.append(pred)
             if delay_between_s > 0 and i < len(subjects) - 1:

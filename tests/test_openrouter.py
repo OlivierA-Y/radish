@@ -173,7 +173,10 @@ def test_main_dry_run_with_openrouter_flag(tmp_path):
         timeout=60,
     )
     assert result.returncode == 0, result.stderr[-1000:]
-    assert (tmp_path / "predictions.csv").exists()
-    assert (tmp_path / "metrics.json").exists()
-    lines = (tmp_path / "predictions.csv").read_text().splitlines()
+    run_dirs = list((tmp_path / "runs").glob("*/"))
+    assert run_dirs, "runs/ subdirectory should be created"
+    run_dir = run_dirs[0]
+    assert (run_dir / "predictions.csv").exists()
+    assert (run_dir / "metrics.json").exists()
+    lines = (run_dir / "predictions.csv").read_text().splitlines()
     assert len(lines) == 5, f"Expected header + 4 rows, got {len(lines)}"

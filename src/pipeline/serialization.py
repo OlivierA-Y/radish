@@ -34,7 +34,7 @@ def to_json(
     payload = {
         "subject_id": subject_id,
         "imaging_features": _round_floats(features),
-        "clinical": clinical or {},
+        "clinical": _filter_clinical(clinical),
     }
     return json.dumps(payload, indent=indent)
 
@@ -46,6 +46,20 @@ def save_json(json_str: str, path: str | Path) -> None:
 # ---------------------------------------------------------------------------
 # Text narrative (what gets inserted into the LLM prompt)
 # ---------------------------------------------------------------------------
+
+def _filter_clinical(clinical: Optional[Dict]) -> Dict:
+    """Return only sex and age from a clinical dict, with normalized keys."""
+    if not clinical:
+        return {}
+    result = {}
+    for k, v in clinical.items():
+        lower = k.lower().strip()
+        if lower == "sex":
+            result["sex"] = v
+        elif lower in ("age at mri", "age"):
+            result["age"] = v
+    return result
+
 
 def _fmt_stats(stats: Dict[str, float]) -> str:
     parts = []
@@ -109,10 +123,11 @@ def to_narrative(
                 er_str = f"  enhancement_ratio={er_r:.3f}" if er_r else ""
                 lines.append(f"  - {name}: {vox} tumour voxels{er_str}")
 
-    # Clinical metadata
-    if clinical:
+    # Clinical metadata (sex and age only)
+    clin_filtered = _filter_clinical(clinical)
+    if clin_filtered:
         lines.append("\n## Clinical Information")
-        for k, v in clinical.items():
+        for k, v in clin_filtered.items():
             lines.append(f"  {k}: {v}")
 
     return "\n".join(lines)
