@@ -115,23 +115,12 @@ def test_extract_all_features_no_atlases():
     images = make_fake_images()
     seg    = make_fake_seg()
     feats  = extract_all_features(images, seg, atlases={}, voxel_size_mm=(1.0, 1.0, 1.0))
-    assert "label_stats" in feats
-    assert "atlas_regions" in feats
-    assert feats["atlas_regions"] == {}
+    assert "semantic_visual" in feats
+    assert "quantitative" in feats
+    assert feats["semantic_visual"]["location features"] == []
 
 
 # ── Serialization ────────────────────────────────────────────────────────────
-
-def test_to_narrative_contains_keywords():
-    from src.pipeline.feature_extraction import extract_all_features
-    from src.pipeline.serialization import to_narrative
-    images   = make_fake_images()
-    seg      = make_fake_seg()
-    features = extract_all_features(images, seg, atlases={}, voxel_size_mm=(1.0, 1.0, 1.0))
-    narr     = to_narrative("sub001", features)
-    assert "sub001" in narr
-    assert "Volume" in narr
-    assert "T1" in narr or "t1" in narr.lower()
 
 
 def test_to_json_valid():
@@ -144,7 +133,8 @@ def test_to_json_valid():
     j        = to_json("sub001", features)
     parsed   = json.loads(j)
     assert parsed["subject_id"] == "sub001"
-    assert "imaging_features" in parsed
+    assert "semantic_visual" in parsed
+    assert "quantitative"    in parsed
 
 
 # ── Synthetic generator ──────────────────────────────────────────────────────
@@ -200,27 +190,3 @@ def test_compute_metrics_balanced_acc():
     expected_bal = (m.sensitivity + m.specificity) / 2
     assert abs(m.balanced_accuracy - expected_bal) < 1e-9
 
-
-# ── LLM response parsing ─────────────────────────────────────────────────────
-
-def test_parse_llm_response_clean_json():
-    from src.pipeline.llm_predictor import _parse_response
-    text = '{"idh_status": "IDH-mutant", "confidence": "high", "reasoning": "Frontal location."}'
-    r = _parse_response(text)
-    assert r["idh_status"] == "IDH-mutant"
-    assert r["confidence"] == "high"
-
-
-def test_parse_llm_response_fenced():
-    from src.pipeline.llm_predictor import _parse_response
-    text = '```json\n{"idh_status": "IDH-wildtype", "confidence": "medium", "reasoning": "Ring enhancement."}\n```'
-    r = _parse_response(text)
-    assert r["idh_status"] == "IDH-wildtype"
-
-
-def test_parse_llm_response_malformed_fallback():
-    from src.pipeline.llm_predictor import _parse_response
-    text = "The tumour shows IDH-mutant features based on frontal location."
-    r = _parse_response(text)
-    assert "idh_status" in r
-    assert "mutant" in r["idh_status"].lower()

@@ -11,95 +11,48 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.pipeline.llm_predictor import (
-    _infer_provider,
     _resolve_model,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL_ALIASES,
-    OPENAI_MODEL_ALIASES,
     LLMPredictor,
 )
 
 
-# ── Provider auto-detection ───────────────────────────────────────────────────
-
-def test_infer_openai_from_gpt_model():
-    assert _infer_provider("gpt-4o", None) == "openai"
-
-def test_infer_openai_explicit():
-    assert _infer_provider("gpt-4o", "openai") == "openai"
-
-def test_infer_openrouter_from_slash_model():
-    assert _infer_provider("anthropic/claude-opus-4", None) == "openrouter"
-
-def test_infer_openrouter_explicit_overrides():
-    # explicit provider always wins over auto-detection
-    assert _infer_provider("gpt-4o", "openrouter") == "openrouter"
-
-def test_infer_openrouter_for_all_slash_models():
-    slash_models = [
-        "anthropic/claude-opus-4",
-        "google/gemini-pro-1.5",
-        "meta-llama/llama-3.3-70b-instruct",
-        "mistralai/mistral-large",
-        "qwen/qwen-2.5-72b-instruct",
-    ]
-    for m in slash_models:
-        assert _infer_provider(m, None) == "openrouter", f"Expected openrouter for {m}"
-
-
 # ── Model alias resolution ────────────────────────────────────────────────────
 
-def test_openai_alias_gpt5():
-    assert _resolve_model("gpt-5", "openai") == "gpt-5-chat-latest"
-
-def test_openai_alias_passthrough():
-    assert _resolve_model("gpt-4o", "openai") == "gpt-4o"
-
 def test_openrouter_alias_claude_opus():
-    assert _resolve_model("claude-opus-4", "openrouter") == "anthropic/claude-opus-4"
+    assert _resolve_model("claude-opus-4") == "anthropic/claude-opus-4"
 
 def test_openrouter_alias_gemini_flash():
-    assert _resolve_model("gemini-flash", "openrouter") == "google/gemini-flash-1.5"
+    assert _resolve_model("gemini-flash") == "google/gemini-flash-1.5"
 
 def test_openrouter_alias_llama():
-    assert _resolve_model("llama-70b", "openrouter") == "meta-llama/llama-3.3-70b-instruct"
+    assert _resolve_model("llama-70b") == "meta-llama/llama-3.3-70b-instruct"
 
 def test_openrouter_full_id_passthrough():
     full = "anthropic/claude-opus-4"
-    assert _resolve_model(full, "openrouter") == full
-
-def test_all_openai_aliases_resolve():
-    for alias, expected in OPENAI_MODEL_ALIASES.items():
-        assert _resolve_model(alias, "openai") == expected
+    assert _resolve_model(full) == full
 
 def test_all_openrouter_aliases_resolve():
     for alias, expected in OPENROUTER_MODEL_ALIASES.items():
-        assert _resolve_model(alias, "openrouter") == expected
+        assert _resolve_model(alias) == expected
 
 
 # ── LLMPredictor construction ─────────────────────────────────────────────────
 
-def test_predictor_default_is_openai():
-    p = LLMPredictor(model="gpt-4o")
-    assert p.provider == "openai"
-    assert p.model    == "gpt-4o"
+def test_predictor_default_model():
+    p = LLMPredictor()
+    assert p.model == "anthropic/claude-opus-4"
 
-def test_predictor_auto_detects_openrouter():
+def test_predictor_alias_resolved():
+    p = LLMPredictor(model="claude-opus-4")
+    assert p.model == "anthropic/claude-opus-4"
+
+def test_predictor_full_id():
     p = LLMPredictor(model="anthropic/claude-opus-4")
-    assert p.provider == "openrouter"
-    assert p.model    == "anthropic/claude-opus-4"
+    assert p.model == "anthropic/claude-opus-4"
 
-def test_predictor_explicit_openrouter_with_alias():
-    p = LLMPredictor(model="claude-opus-4", provider="openrouter")
-    assert p.provider == "openrouter"
-    assert p.model    == "anthropic/claude-opus-4"
-
-def test_predictor_explicit_openai_with_alias():
-    p = LLMPredictor(model="gpt-5", provider="openai")
-    assert p.provider == "openai"
-    assert p.model    == "gpt-5-chat-latest"
-
-def test_predictor_openrouter_default_headers():
+def test_predictor_custom_headers():
     p = LLMPredictor(model="anthropic/claude-opus-4",
                      http_referer="https://myapp.example",
                      app_title="MyApp")
@@ -109,16 +62,10 @@ def test_predictor_openrouter_default_headers():
 
 # ── Client raises on missing key (no network needed) ─────────────────────────
 
-def test_openai_client_raises_without_key(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    p = LLMPredictor(model="gpt-4o", provider="openai")
-    with pytest.raises(EnvironmentError, match="OPENAI_API_KEY"):
-        p._get_client()
-
-def test_openrouter_client_raises_without_key(monkeypatch, tmp_path):
+def test_client_raises_without_key(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.chdir(tmp_path)   # no .env file here
-    p = LLMPredictor(model="anthropic/claude-opus-4", provider="openrouter")
+    monkeypatch.chdir(tmp_path)
+    p = LLMPredictor(model="anthropic/claude-opus-4")
     with pytest.raises(EnvironmentError, match="OPENROUTER_API_KEY"):
         p._get_client()
 
@@ -149,12 +96,10 @@ def test_load_env_key_returns_none_when_absent(tmp_path, monkeypatch):
     assert _load_env_key("OPENROUTER_API_KEY") is None
 
 
-# ── CLI integration — dry_run still works with openrouter flag ────────────────
+# ── CLI integration ───────────────────────────────────────────────────────────
 
-def test_main_dry_run_with_openrouter_flag(tmp_path):
-    import json
+def test_main_dry_run(tmp_path):
     import subprocess
-    import sys
 
     result = subprocess.run(
         [
@@ -162,7 +107,6 @@ def test_main_dry_run_with_openrouter_flag(tmp_path):
             "--mode", "synthetic",
             "--n_mutant", "2",
             "--n_wildtype", "2",
-            "--provider", "openrouter",
             "--model", "anthropic/claude-opus-4",
             "--dry_run",
             "--output_dir", str(tmp_path),

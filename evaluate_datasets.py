@@ -85,7 +85,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     from src.pipeline.registration import register_subject
     from src.pipeline.atlas_mapping import load_all_atlases
     from src.pipeline.feature_extraction import extract_all_features
-    from src.pipeline.serialization import to_narrative, to_json, save_json
+    from src.pipeline.serialization import to_json, save_json
     from src.pipeline.llm_predictor import LLMPredictor
     from src.pipeline.evaluation import (
         evaluate_predictions, save_metrics, save_predictions_csv, save_reasoning_traces,
@@ -109,7 +109,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.warning("Atlas load failed: %s", e)
 
-    predictor  = LLMPredictor(model=args.model, provider=args.provider)
+    predictor  = LLMPredictor(model=args.model)
     all_metrics = []
 
     for ds_cfg in config["datasets"]:
@@ -144,17 +144,16 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     subject.images, subject.affine, method="auto"
                 )
                 features  = extract_all_features(images, seg, atlases, subject.voxel_size_mm)
-                narrative = to_narrative(sid, features, clinical=subj.get("clinical", {}))
                 json_str  = to_json(sid, features, clinical=subj.get("clinical", {}))
                 save_json(json_str, feat_dir / f"{sid}.json")
 
                 pred = predictor.predict(
                     subject_id=sid,
-                    narrative=narrative,
                     ground_truth=subj["idh_label"],
+                    features_dict=features,
                 )
                 predictions.append(pred)
-                logger.info("  %s → %s [%s]", sid, pred.idh_status, pred.confidence)
+                logger.info("  %s → %s", sid, pred.idh_status)
 
             except Exception as e:
                 logger.error("  Error processing %s: %s", sid, e)
@@ -194,11 +193,8 @@ def _print_table(metrics_list: list) -> None:
 def main():
     p = argparse.ArgumentParser(description="Cross-dataset IDH evaluation")
     p.add_argument("--config",     type=str, default=None)
-    p.add_argument("--model",      type=str, default="gpt-4o",
-                   help="Model ID (gpt-4o, anthropic/claude-opus-4, …)")
-    p.add_argument("--provider",   type=str, default=None,
-                   choices=["openai", "openrouter"],
-                   help="API provider (auto-detected from model name if omitted)")
+    p.add_argument("--model",      type=str, default="anthropic/claude-opus-4",
+                   help="OpenRouter model ID or alias")
     p.add_argument("--output_dir", type=str, default="results/cross_dataset/")
     args = p.parse_args()
     run_evaluation(args)

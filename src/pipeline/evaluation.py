@@ -107,11 +107,10 @@ def evaluate_predictions(predictions, model: str = "", dataset: str = "") -> Eva
     if not labelled:
         raise ValueError("No predictions have ground-truth labels")
 
-    y_true  = [p.ground_truth for p in labelled]
-    y_pred  = [p.label for p in labelled]
-    y_score = [p.confidence_score for p in labelled]
+    y_true = [p.ground_truth for p in labelled]
+    y_pred = [p.label for p in labelled]
 
-    return compute_metrics(y_true, y_pred, y_score, model=model, dataset=dataset)
+    return compute_metrics(y_true, y_pred, model=model, dataset=dataset)
 
 
 def save_metrics(metrics: EvalMetrics, path: str | Path) -> None:
@@ -121,7 +120,7 @@ def save_metrics(metrics: EvalMetrics, path: str | Path) -> None:
 def save_predictions_csv(predictions, path: str | Path) -> None:
     import csv
     fieldnames = [
-        "subject_id", "model", "idh_status", "confidence",
+        "subject_id", "model", "idh_status",
         "label", "ground_truth", "correct", "latency_s", "reasoning",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -132,7 +131,6 @@ def save_predictions_csv(predictions, path: str | Path) -> None:
                 "subject_id":   p.subject_id,
                 "model":        p.model,
                 "idh_status":   p.idh_status,
-                "confidence":   p.confidence,
                 "label":        p.label,
                 "ground_truth": p.ground_truth,
                 "correct":      p.correct,

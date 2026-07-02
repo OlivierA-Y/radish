@@ -1,20 +1,17 @@
 """
-Main pipeline runner — zero-shot IDH mutation prediction.
+Main pipeline runner — zero-shot IDH mutation prediction via OpenRouter.
 
 Usage:
   # Synthetic data, dry run (no API key needed)
   python main.py --mode synthetic --n_mutant 10 --n_wildtype 10 --dry_run
 
-  # OpenAI
-  python main.py --mode synthetic --provider openai --model gpt-4o
-
-  # OpenRouter — any model, one key
-  python main.py --mode synthetic --provider openrouter --model anthropic/claude-opus-4
-  python main.py --mode synthetic --model anthropic/claude-opus-4   # auto-detected
+  # OpenRouter — any model, one key (OPENROUTER_API_KEY)
+  python main.py --mode synthetic --model anthropic/claude-opus-4
+  python main.py --mode synthetic --model claude-opus-4   # alias
 
   # Real data
-  python main.py --mode tcga   --data_root data/TCGA-LGG/  --model gpt-4o
-  python main.py --mode ucsf   --data_root data/UCSF-PDGM/ --model gpt-4o
+  python main.py --mode tcga   --data_root data/TCGA-LGG/  --model anthropic/claude-opus-4
+  python main.py --mode ucsf   --data_root data/UCSF-PDGM/ --model anthropic/claude-opus-4
   python main.py --mode manifest --manifest data/my_cohort.csv --data_root data/
 """
 
@@ -25,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -46,12 +44,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Root directory for real data")
     p.add_argument("--manifest", type=str, default=None,
                    help="CSV manifest (for --mode manifest)")
-    p.add_argument("--model", type=str, default="gpt-4o",
-                   help="Model ID — OpenAI (gpt-4o) or OpenRouter (anthropic/claude-opus-4, …)")
-    p.add_argument("--provider", type=str, default=None,
-                   choices=["openai", "openrouter"],
-                   help="API provider. Auto-detected from model name if omitted "
-                        "(a '/' in the model ID → openrouter).")
+    p.add_argument("--model", type=str, default="anthropic/claude-opus-4",
+                   help="OpenRouter model ID or alias (e.g. anthropic/claude-opus-4, claude-opus-4)")
     p.add_argument("--n_mutant",   type=int, default=10, help="# synthetic mutant subjects")
     p.add_argument("--n_wildtype", type=int, default=10, help="# synthetic wildtype subjects")
     p.add_argument("--output_dir", type=str, default="results/",
@@ -69,10 +63,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", choices=["mutant", "wildtype"], default=None,
                    help="Restrict to subjects with a known label (mutant=1, wildtype=0)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max_workers", type=int, default=5,
+                   help="Parallel LLM threads (default 5; 1 = sequential)")
+    p.add_argument("--max_retries", type=int, default=3,
+                   help="LLM call retries on failure (default 3)")
+    p.add_argument("--fetch_delay", type=float, default=0.5,
+                   help="Seconds between LLM request submissions to avoid rate limiting (default 0.5)")
     return p
 
 
-def _mock_predict(subject_id: str, narrative: str, ground_truth=None):
+def _mock_predict(subject_id: str, ground_truth=None):
     """Deterministic fake LLM response for --dry_run testing."""
     import hashlib
     from src.pipeline.llm_predictor import IDHPrediction
@@ -83,17 +83,10 @@ def _mock_predict(subject_id: str, narrative: str, ground_truth=None):
         subject_id=subject_id,
         model="mock",
         idh_status=status,
-        confidence="medium",
         reasoning="Mock prediction for dry-run testing.",
-        raw_response='{"idh_status":"' + status + '","confidence":"medium","reasoning":"Mock."}',
+        raw_response='{"idh_status":"' + status + '","reasoning":"Mock."}',
         latency_s=0.001,
         ground_truth=ground_truth,
-        decisive_feature="wt.volume_mm3",
-        supporting_features=["wt.t1.mean"],
-        contradicting_features=[],
-        findings="Mock findings paragraph.",
-        impression="Mock impression sentence.",
-        phantom_citations=[],
         model_version="mock-v1",
     )
 
@@ -106,7 +99,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     from src.pipeline.registration import register_subject
     from src.pipeline.atlas_mapping import load_all_atlases
     from src.pipeline.feature_extraction import extract_all_features
-    from src.pipeline.serialization import to_narrative, to_json, save_json
+    from src.pipeline.serialization import to_json, save_json
     from src.pipeline.llm_predictor import LLMPredictor
     from src.pipeline.evaluation import evaluate_predictions, save_metrics, save_predictions_csv, save_reasoning_traces
 
@@ -214,14 +207,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
             }) + "\n")
         predictor = LLMPredictor(
             model=args.model,
-            provider=args.provider,
             log_path=run_log,
+            max_retries=args.max_retries,
         )
         logger.info("Run directory: %s", run_dir)
 
-    # ── 4. Process each subject ───────────────────────────────────────────
+    # ── 4. Feature extraction (sequential, cached) ───────────────────────
 
-    all_predictions = []
+    prediction_inputs = []   # collected for parallel LLM step
     features_dir = out_dir / "features"
     features_dir.mkdir(exist_ok=True)
 
@@ -231,12 +224,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.info("Processing %s…", sid)
 
         try:
-            # A+B) Feature extraction — load from cache if available
             idh_label = subj_data.get("idh_label")
             clinical  = subj_data.get("clinical", {}) if args.mode != "synthetic" else {}
 
             if cache_path.exists():
-                cached   = json.loads(cache_path.read_text(encoding="utf-8"))
+                json_str = cache_path.read_text(encoding="utf-8")
+                cached   = json.loads(json_str)
                 features = cached["imaging_features"]
                 clinical = cached.get("clinical") or clinical
                 logger.info("Loaded cached features for %s (skipping MRI processing)", sid)
@@ -257,7 +250,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     affine     = subject.affine
                     voxel_size = subject.voxel_size_mm
 
-                    # Segmentation
                     if subj_data.get("seg_path") and Path(subj_data["seg_path"]).exists():
                         import nibabel as nib
                         import numpy as np
@@ -267,12 +259,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     else:
                         seg = segmenter.segment(images, affine)
 
-                    # Registration (skip for synthetic; already in voxel space)
                     if args.reg_method != "affine" or args.mode != "synthetic":
                         images, affine = register_subject(
                             images, affine, method=args.reg_method
                         )
-                        # Resample seg to match registered image space (nearest-neighbour)
                         from src.pipeline.registration import resample_to_shape
                         import numpy as _np
                         target_shape = next(iter(images.values())).shape
@@ -286,37 +276,62 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     voxel_size_mm=voxel_size,
                 )
 
-                # C) Persist features
                 json_str = to_json(sid, features, clinical=clinical)
                 save_json(json_str, cache_path)
 
-            # Always regenerate narrative (cheap, prompt-template may change)
-            narrative = to_narrative(sid, features, clinical=clinical)
-
-            # D) LLM prediction
-            if args.no_llm:
-                logger.info("Skipping LLM for %s (--no_llm)", sid)
-                continue
-
-            if args.dry_run:
-                pred = _mock_predict(sid, narrative, ground_truth=idh_label)
-            else:
-                pred = predictor.predict(
-                    subject_id=sid,
-                    narrative=narrative,
-                    ground_truth=idh_label,
-                    features_dict=features,
-                    clinical_dict=clinical,
-                )
-
-            all_predictions.append(pred)
-            status_str = f"→ {pred.idh_status} [{pred.confidence}]"
-            if pred.correct is not None:
-                status_str += f"  ({'✓' if pred.correct else '✗'})"
-            logger.info("%s  %s", sid, status_str)
+            if not args.no_llm:
+                prediction_inputs.append({
+                    "subject_id":    sid,
+                    "ground_truth":  idh_label,
+                    "features_dict": features,
+                    "clinical_dict": clinical,
+                })
 
         except Exception as e:
             logger.error("Failed to process %s: %s", sid, e, exc_info=True)
+
+    # ── 5. LLM predictions (parallel) ────────────────────────────────────
+
+    all_predictions = []
+
+    if args.no_llm:
+        logger.info("Skipping LLM (--no_llm)")
+    elif prediction_inputs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _predict_one(inp: dict):
+            sid = inp["subject_id"]
+            if args.dry_run:
+                return _mock_predict(sid, ground_truth=inp["ground_truth"])
+            return predictor.predict(
+                subject_id=sid,
+                ground_truth=inp["ground_truth"],
+                features_dict=inp["features_dict"],
+                clinical_dict=inp["clinical_dict"],
+            )
+
+        n_workers = min(args.max_workers, len(prediction_inputs))
+        logger.info(
+            "Running %d LLM predictions with %d parallel workers…",
+            len(prediction_inputs), n_workers,
+        )
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {}
+            for i, inp in enumerate(prediction_inputs):
+                futures[executor.submit(_predict_one, inp)] = inp["subject_id"]
+                if args.fetch_delay > 0 and i < len(prediction_inputs) - 1:
+                    time.sleep(args.fetch_delay)
+            for future in as_completed(futures):
+                sid = futures[future]
+                try:
+                    pred = future.result()
+                    all_predictions.append(pred)
+                    status_str = f"→ {pred.idh_status}"
+                    if pred.correct is not None:
+                        status_str += f"  ({'✓' if pred.correct else '✗'})"
+                    logger.info("%s  %s", sid, status_str)
+                except Exception as e:
+                    logger.error("Failed to predict %s: %s", sid, e, exc_info=True)
 
     # ── 5. Evaluate ───────────────────────────────────────────────────────
     if all_predictions:
