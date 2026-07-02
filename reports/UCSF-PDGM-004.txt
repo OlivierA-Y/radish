@@ -1,0 +1,24 @@
+============================================================
+  CLINICAL AI REPORT — IDH MUTATION STATUS ANALYSIS
+============================================================
+  Subject:      UCSF-PDGM-004
+  Source log:   llm_log_20260605_094038.jsonl
+  Original run: 2026-06-05T13:40:55.987551+00:00
+  Report model: openai/gpt-oss-120b:free
+  Generated:    2026-06-11 23:22:17
+============================================================
+
+CLINICAL INDICATION  
+66‑year‑old male with suspected primary brain tumor.
+
+TECHNIQUE  
+MRI of the brain performed with standard protocol including pre‑ and post‑contrast T1‑weighted, T2‑weighted, and FLAIR sequences. Quantitative volumetric and signal intensity analysis was generated from the imaging data.
+
+FINDINGS  
+There is a large, heterogeneously enhancing mass in the right cerebral hemisphere measuring approximately 12.5 cm³ (enhancing tumor volume 12531 mm³). The enhancing component demonstrates a high mean T1‑post‑contrast intensity (et.t1ce.mean ≈ 0.70, std 0.21) with values ranging from 0.33 to 0.99. Central necrosis is present, occupying about 6.1 cm³ (necrotic core volume 6117 mm³) with low T1‑CE signal (ncr.t1ce.mean ≈ 0.16) and relatively higher T2 signal (ncr.t2.mean ≈ 0.49). Surrounding vasogenic edema extends over roughly 14.9 cm³ (edema volume 14920 mm³) and is hyperintense on T2 (ed.t2.mean ≈ 0.32) and FLAIR (ed.flair.mean ≈ 0.80). The non‑enhancing tumor component (whole tumor volume 33.6 cm³) shows intermediate T1‑CE signal (wt.t1ce.mean ≈ 0.40) and high FLAIR signal (wt.flair.mean ≈ 0.84). Margins are irregular, and there is no mention of hemorrhage or calcification.
+
+IMPRESSION  
+Imaging is most consistent with an IDH‑wildtype glioblastoma; AI prediction confidence is high. Differential considerations include other high‑grade gliomas (e.g., IDH‑mutant grade IV) and primary CNS lymphoma, though the quantitative profile favors glioblastoma.
+
+AI ANALYSIS NOTE  
+AI assistance was used; the decisive feature for the IDH‑wildtype prediction was the high mean T1‑CE intensity of the enhancing tumor (et.t1ce.mean).

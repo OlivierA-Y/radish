@@ -1,0 +1,24 @@
+============================================================
+  CLINICAL AI REPORT — IDH MUTATION STATUS ANALYSIS
+============================================================
+  Subject:      UCSF-PDGM-044
+  Source log:   llm_log.jsonl
+  Original run: 2026-06-12T02:37:57.673819+00:00
+  Report model: openai/gpt-oss-120b:free
+  Generated:    2026-06-12 13:51:45
+============================================================
+
+CLINICAL INDICATION  
+Evaluation of a newly diagnosed supratentorial brain mass in a 38‑year‑old male.
+
+TECHNIQUE  
+Multiplanar magnetic resonance imaging of the brain was performed, including pre‑ and post‑contrast T1‑weighted, T2‑weighted, and fluid‑attenuated inversion recovery (FLAIR) sequences. Quantitative volumetric and signal intensity analyses were generated from the imaging data.
+
+FINDINGS  
+A large, heterogeneous supratentorial lesion is present with a total volume of approximately 97 cm³. The enhancing tumor component measures about 19 cm³ and demonstrates a mean post‑contrast T1‑weighted intensity of 0.722 (SD 0.208, range 0.377–1.00). A necrotic core of roughly 6 cm³ shows lower T1‑CE intensity (mean 0.265) and modestly elevated T2 signal (mean 0.416). Peritumoral edema is extensive, encompassing approximately 72 cm³, with mean T1‑CE intensity 0.302 and mean FLAIR intensity 0.791, indicating marked hyperintensity. The non‑enhancing tumor portion (whole tumor minus enhancing and necrotic components) exhibits mean T1‑CE intensity 0.381, mean T2 intensity 0.363, and mean FLAIR intensity 0.783. No additional lesions or midline shift are identified.
+
+IMPRESSION  
+AI‑derived prediction: IDH‑mutant glioma, medium confidence. The imaging pattern of a large, infiltrative mass with extensive edema and relatively modest enhancement in a young adult favors a lower‑grade, IDH‑mutant glioma, though a high‑grade IDH‑wildtype tumor cannot be excluded.
+
+AI ANALYSIS NOTE  
+This report incorporates AI assistance; the decisive feature for the IDH prediction was the patient’s age.

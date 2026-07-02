@@ -1,6 +1,5 @@
 """
-LLM prediction module — zero-shot IDH mutation classification.
-Supports OpenAI (GPT-4o, GPT-5) and OpenRouter (Claude, Gemini, Llama, …).
+LLM prediction module — zero-shot IDH mutation classification via OpenRouter.
 """
 
 from __future__ import annotations
@@ -8,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,14 +20,6 @@ logger = logging.getLogger(__name__)
 # Model aliases
 # ---------------------------------------------------------------------------
 
-OPENAI_MODEL_ALIASES: Dict[str, str] = {
-    "gpt-4o":            "gpt-4o",
-    "gpt-4o-mini":       "gpt-4o-mini",
-    "gpt-5":             "gpt-5-chat-latest",
-    "gpt-5-chat-latest": "gpt-5-chat-latest",
-}
-
-# Convenience aliases for popular OpenRouter models
 OPENROUTER_MODEL_ALIASES: Dict[str, str] = {
     "claude-opus-4":        "anthropic/claude-opus-4",
     "claude-sonnet-4-5":    "anthropic/claude-sonnet-4.5",
@@ -42,25 +33,36 @@ OPENROUTER_MODEL_ALIASES: Dict[str, str] = {
 }
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL       = "gpt-4o"
-DEFAULT_PROVIDER    = "openai"
+DEFAULT_MODEL       = "anthropic/claude-opus-4"
+
+IDH_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "idh_prediction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "idh_status": {
+                    "type": "string",
+                    "description": "IDH mutation status: 'IDH-mutant' or 'IDH-wildtype'",
+                    "enum": ["IDH-mutant", "IDH-wildtype"],
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Compact clinical reasoning based on MRI imaging features",
+                },
+            },
+            "required": ["idh_status", "reasoning"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
-def _resolve_model(model: str, provider: str) -> str:
-    """Expand short aliases to full model IDs."""
-    if provider == "openrouter":
-        return OPENROUTER_MODEL_ALIASES.get(model, model)
-    return OPENAI_MODEL_ALIASES.get(model, model)
-
-
-def _infer_provider(model: str, provider: Optional[str]) -> str:
-    """
-    If provider is not given explicitly, infer from model string:
-    a slash in the model name (e.g. 'anthropic/claude-opus-4') signals OpenRouter.
-    """
-    if provider:
-        return provider
-    return "openrouter" if "/" in model else "openai"
+def _resolve_model(model: str) -> str:
+    """Expand short aliases to full OpenRouter model IDs."""
+    return OPENROUTER_MODEL_ALIASES.get(model, model)
 
 
 @dataclass
@@ -68,19 +70,10 @@ class IDHPrediction:
     subject_id: str
     model: str
     idh_status: str          # "IDH-mutant" | "IDH-wildtype"
-    confidence: str          # "high" | "medium" | "low"
     reasoning: str
     raw_response: str
     latency_s: float
     ground_truth: Optional[int] = None    # 1 = mutant, 0 = wildtype
-    # Structured rationale fields (Change 1)
-    decisive_feature: Optional[str] = None
-    supporting_features: Optional[List[str]] = None
-    contradicting_features: Optional[List[str]] = None
-    findings: Optional[str] = None
-    impression: Optional[str] = None
-    phantom_citations: Optional[List[str]] = None
-    # Determinism tracking (Change 4)
     model_version: Optional[str] = None
     correct: Optional[bool] = field(default=None, init=False)
 
@@ -93,74 +86,7 @@ class IDHPrediction:
     def label(self) -> int:
         return 1 if "mutant" in self.idh_status.lower() else 0
 
-    @property
-    def confidence_score(self) -> float:
-        return {"high": 0.9, "medium": 0.65, "low": 0.4}.get(self.confidence.lower(), 0.5)
 
-    def cited_identifiers(self) -> List[str]:
-        """Return all feature identifiers cited in the structured rationale."""
-        cited: List[str] = []
-        if self.decisive_feature:
-            cited.append(self.decisive_feature)
-        if self.supporting_features:
-            cited.extend(self.supporting_features)
-        if self.contradicting_features:
-            cited.extend(self.contradicting_features)
-        return cited
-
-
-def _parse_response(text: str) -> Dict:
-    """Extract JSON from LLM response (handles markdown code fences)."""
-    # Strip markdown fences
-    cleaned = re.sub(r"```(?:json)?", "", text).strip("`").strip()
-    # Find first JSON object
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group())
-            # Ensure list fields are lists, not None
-            for list_field in ("supporting_features", "contradicting_features"):
-                if parsed.get(list_field) is None:
-                    parsed[list_field] = []
-            return parsed
-        except json.JSONDecodeError:
-            pass
-    # Fallback: regex field extraction
-    idh = "IDH-wildtype"
-    if re.search(r"idh.mutant", text, re.IGNORECASE):
-        idh = "IDH-mutant"
-    conf_match = re.search(r'"confidence"\s*:\s*"(\w+)"', text, re.IGNORECASE)
-    confidence = conf_match.group(1) if conf_match else "low"
-    reason_match = re.search(r'"reasoning"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
-    reasoning = reason_match.group(1) if reason_match else text[:300]
-    return {
-        "idh_status": idh,
-        "confidence": confidence,
-        "reasoning": reasoning,
-        "decisive_feature": None,
-        "supporting_features": [],
-        "contradicting_features": [],
-        "findings": None,
-        "impression": None,
-    }
-
-
-def _compute_phantom_citations(
-    decisive: Optional[str],
-    supporting: Optional[List[str]],
-    contradicting: Optional[List[str]],
-    vocabulary: Optional[List[str]],
-) -> List[str]:
-    """Return cited feature names not present in the feature vocabulary."""
-    if not vocabulary:
-        return []
-    vocab_set = set(vocabulary)
-    cited: List[str] = []
-    if decisive:
-        cited.append(decisive)
-    cited.extend(supporting or [])
-    cited.extend(contradicting or [])
-    return [c for c in cited if c and c not in vocab_set]
 
 
 def _load_env_key(var_name: str) -> Optional[str]:
@@ -179,24 +105,14 @@ def _load_env_key(var_name: str) -> Optional[str]:
 
 class LLMPredictor:
     """
-    Zero-shot IDH prediction via a chat completion API.
-
-    provider="openai"     — OpenAI API (GPT-4o, GPT-5, …)
-                            Key: OPENAI_API_KEY
-    provider="openrouter" — OpenRouter (Claude, Gemini, Llama, Mistral, …)
-                            Key: OPENROUTER_API_KEY
-                            Docs: https://openrouter.ai/docs
-
-    Auto-detection: if model contains '/' (e.g. 'anthropic/claude-opus-4'),
-    the provider defaults to 'openrouter' even if not specified.
-
-    seed=<int> pins the random seed for determinism (Change 4).
+    Zero-shot IDH prediction via OpenRouter (Claude, Gemini, Llama, Mistral, …).
+    Key: OPENROUTER_API_KEY — https://openrouter.ai/keys
+    seed=<int> pins the random seed for determinism.
     """
 
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
-        provider: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 1024,
         max_retries: int = 3,
@@ -206,8 +122,7 @@ class LLMPredictor:
         log_path: Optional[str | Path] = None,
         seed: Optional[int] = 42,
     ):
-        self.provider       = _infer_provider(model, provider)
-        self.model          = _resolve_model(model, self.provider)
+        self.model          = _resolve_model(model)
         self.temperature    = temperature
         self.max_tokens     = max_tokens
         self.max_retries    = max_retries
@@ -217,16 +132,19 @@ class LLMPredictor:
         self.log_path       = Path(log_path) if log_path else None
         self.seed           = seed
         self._client        = None
+        self._log_lock      = threading.Lock()
+        self._init_lock     = threading.Lock()
 
     def _get_client(self):
         if self._client is not None:
             return self._client
-        try:
-            from openai import OpenAI
-        except ImportError as e:
-            raise ImportError("openai>=1.30.0 is required: pip install openai") from e
-
-        if self.provider == "openrouter":
+        with self._init_lock:
+            if self._client is not None:
+                return self._client
+            try:
+                from openai import OpenAI
+            except ImportError as e:
+                raise ImportError("openai>=1.30.0 is required: pip install openai") from e
             api_key = _load_env_key("OPENROUTER_API_KEY")
             if not api_key:
                 raise EnvironmentError(
@@ -242,25 +160,19 @@ class LLMPredictor:
                     "X-Title":      self.app_title,
                 },
             )
-            logger.info("Using OpenRouter — model: %s", self.model)
-        else:
-            api_key = _load_env_key("OPENAI_API_KEY")
-            if not api_key:
-                raise EnvironmentError(
-                    "OPENAI_API_KEY not found. "
-                    "Set it in the environment or in a .env file."
-                )
-            self._client = OpenAI(api_key=api_key)
-            logger.info("Using OpenAI — model: %s", self.model)
-
+            logger.info("OpenRouter — model: %s", self.model)
         return self._client
 
     def _append_log(self, entry: Dict) -> None:
         if self.log_path is None:
             return
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._log_lock:
+                with self.log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write log entry for %s: %s", entry.get("subject_id"), exc)
 
     def raw_query(self, messages: List[Dict]) -> str:
         """Make a direct API call and return the raw response string."""
@@ -279,7 +191,6 @@ class LLMPredictor:
     def predict(
         self,
         subject_id: str,
-        narrative: str,
         ground_truth: Optional[int] = None,
         features_dict: Optional[Dict] = None,
         clinical_dict: Optional[Dict] = None,
@@ -287,18 +198,15 @@ class LLMPredictor:
         user_prompt_template: Optional[str] = None,
     ) -> IDHPrediction:
         from src.prompts.templates import build_prompt
-        from src.pipeline.interventions import extract_feature_vocabulary
 
-        # Build feature vocabulary from features dict (Change 1)
-        feature_vocabulary: Optional[List[str]] = None
-        if features_dict is not None:
-            feature_vocabulary = extract_feature_vocabulary(features_dict, clinical=clinical_dict)
-
-        sys_p, usr_p = build_prompt(narrative, feature_vocabulary=feature_vocabulary)
+        sys_p, usr_p = build_prompt(features_dict or {}, clinical_dict)
         if system_prompt:
             sys_p = system_prompt
         if user_prompt_template:
-            usr_p = user_prompt_template.format(narrative=narrative)
+            payload = dict(features_dict or {})
+            if clinical_dict:
+                payload = {"clinical_dict": clinical_dict, **payload}
+            usr_p = user_prompt_template + f"\n\nHere is the json data:\n{json.dumps(payload, indent=4)}"
 
         messages = [
             {"role": "system",  "content": sys_p},
@@ -307,6 +215,9 @@ class LLMPredictor:
 
         client = self._get_client()
         last_err = None
+        prediction = None
+        log_entry: Dict = {}
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 t0 = time.perf_counter()
@@ -315,43 +226,27 @@ class LLMPredictor:
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    response_format=IDH_RESPONSE_FORMAT,
                 )
                 if self.seed is not None:
                     kwargs["seed"] = self.seed
                 response = client.chat.completions.create(**kwargs)
                 latency = time.perf_counter() - t0
                 raw = response.choices[0].message.content or ""
-                parsed = _parse_response(raw)
-
-                # Compute phantom citations (Change 1)
-                phantom = _compute_phantom_citations(
-                    decisive=parsed.get("decisive_feature"),
-                    supporting=parsed.get("supporting_features"),
-                    contradicting=parsed.get("contradicting_features"),
-                    vocabulary=feature_vocabulary,
-                )
-
-                # Capture actual model version from API response (Change 4)
+                parsed = json.loads(raw)
                 model_version = getattr(response, "model", self.model)
 
                 prediction = IDHPrediction(
                     subject_id=subject_id,
                     model=self.model,
                     idh_status=parsed.get("idh_status", "IDH-wildtype"),
-                    confidence=parsed.get("confidence", "low"),
                     reasoning=parsed.get("reasoning", ""),
                     raw_response=raw,
                     latency_s=latency,
                     ground_truth=ground_truth,
-                    decisive_feature=parsed.get("decisive_feature"),
-                    supporting_features=parsed.get("supporting_features") or [],
-                    contradicting_features=parsed.get("contradicting_features") or [],
-                    findings=parsed.get("findings"),
-                    impression=parsed.get("impression"),
-                    phantom_citations=phantom,
                     model_version=model_version,
                 )
-                self._append_log({
+                log_entry = {
                     "timestamp":     datetime.now(timezone.utc).isoformat(),
                     "subject_id":    subject_id,
                     "model":         self.model,
@@ -362,9 +257,8 @@ class LLMPredictor:
                     "raw_response":  raw,
                     "parsed":        parsed,
                     "latency_s":     latency,
-                    "phantom_citations": phantom,
-                })
-                return prediction
+                }
+                break   # success — exit retry loop
             except Exception as e:
                 last_err = e
                 logger.warning(
@@ -373,18 +267,45 @@ class LLMPredictor:
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay_s * attempt)
 
-        raise RuntimeError(f"LLM prediction failed after {self.max_retries} attempts: {last_err}")
+        if prediction is None:
+            raise RuntimeError(f"LLM prediction failed after {self.max_retries} attempts: {last_err}")
+
+        # Write to log outside the retry loop so a log I/O error cannot trigger a retry
+        self._append_log(log_entry)
+        return prediction
 
     def predict_batch(
         self,
         subjects: List[Dict],
+        max_workers: int = 1,
         delay_between_s: float = 0.5,
     ) -> List[IDHPrediction]:
         """
-        subjects: list of dicts with keys: subject_id, narrative, ground_truth (optional),
-                  features_dict (optional)
+        subjects: list of dicts with keys: subject_id, features_dict, ground_truth (optional),
+                  clinical_dict (optional)
+
+        max_workers > 1 fires all LLM calls concurrently via ThreadPoolExecutor.
         """
-        results = []
+        if max_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results: List[IDHPrediction | None] = [None] * len(subjects)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self.predict,
+                        subject_id=subj["subject_id"],
+                        ground_truth=subj.get("ground_truth"),
+                        features_dict=subj.get("features_dict"),
+                        clinical_dict=subj.get("clinical_dict"),
+                    ): i
+                    for i, subj in enumerate(subjects)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results[idx] = future.result()
+            return [r for r in results if r is not None]
+
+        results_seq = []
         for i, subj in enumerate(subjects):
             logger.info(
                 "Predicting subject %d/%d: %s",
@@ -392,11 +313,11 @@ class LLMPredictor:
             )
             pred = self.predict(
                 subject_id=subj["subject_id"],
-                narrative=subj["narrative"],
                 ground_truth=subj.get("ground_truth"),
                 features_dict=subj.get("features_dict"),
+                clinical_dict=subj.get("clinical_dict"),
             )
-            results.append(pred)
+            results_seq.append(pred)
             if delay_between_s > 0 and i < len(subjects) - 1:
                 time.sleep(delay_between_s)
-        return results
+        return results_seq

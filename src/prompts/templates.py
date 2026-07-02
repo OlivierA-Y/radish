@@ -3,110 +3,40 @@ LLM prompt templates for zero-shot IDH mutation prediction.
 Mirrors the prompt structure described in the paper.
 """
 
-from typing import List, Optional
-
-SYSTEM_PROMPT = """\
-You are an expert neuroradiologist and molecular neuropathologist with deep \
-knowledge of glioma biology. You will be given a structured MRI-derived feature \
-report for a patient with a confirmed brain glioma. Your task is to predict the \
-IDH (isocitrate dehydrogenase) mutation status of the tumour using only the \
-imaging-derived and clinical features provided — no additional information is \
-available.
-
-Key imaging correlates of IDH mutation status:
-- IDH-MUTANT gliomas: typically frontal/anterior location, well-defined margins, \
-  lower grade at presentation, less enhancement, higher T2/FLAIR signal relative \
-  to T1-CE, lower enhancement ratios, larger oedema-to-tumour volume ratios.
-- IDH-WILDTYPE (GBM): often parietal/temporal/multifocal, irregular margins, \
-  high enhancement (T1-CE), ring-enhancing pattern, necrotic core, higher \
-  enhancement ratios, older patient age.
-
-Reason step by step before giving your final answer.
-When citing features, use ONLY identifiers from the AVAILABLE FEATURES list provided."""
-
-USER_PROMPT_TEMPLATE = """\
-Below is the MRI feature report for this patient. Based on these features, \
-predict whether the tumour is IDH-mutant or IDH-wildtype.
-
-{narrative}
-
----
-AVAILABLE FEATURES (use ONLY these identifiers when citing features):
-{feature_vocabulary}
-
----
-Respond ONLY in the following JSON format (no extra text):
-{{
-  "idh_status": "IDH-mutant" | "IDH-wildtype",
-  "confidence": "high" | "medium" | "low",
-  "reasoning": "<2-4 sentence explanation citing specific imaging features>",
-  "decisive_feature": "<single most decisive feature identifier from AVAILABLE FEATURES>",
-  "supporting_features": ["<feature_id>", ...],
-  "contradicting_features": ["<feature_id>", ...],
-  "findings": "<draft Findings paragraph for a radiology report>",
-  "impression": "<one-sentence draft Impression for a radiology report>"
-}}"""
-
-COUNTERFACTUAL_PROMPT_TEMPLATE = """\
-You previously predicted {original_prediction} for this case. What single minimal \
-change to the features below would most likely flip your prediction to {opposite_prediction}?
-
-{narrative}
-
----
-AVAILABLE FEATURES:
-{feature_vocabulary}
-
----
-Respond ONLY in the following JSON format (no extra text):
-{{
-  "feature_to_change": "<feature identifier from AVAILABLE FEATURES>",
-  "current_value": <current numeric value>,
-  "new_value": <new numeric value that would flip the prediction>,
-  "reasoning": "<why this change would flip the prediction>"
-}}"""
-
-OPPOSITE_RATIONALE_PROMPT_TEMPLATE = """\
-Based on the MRI features below, write a radiology assessment arguing for \
-{target_prediction}. Make the strongest possible case for {target_prediction} \
-using only the features provided.
-
-{narrative}
-
----
-Respond ONLY in the following JSON format (no extra text):
-{{
-  "findings": "<Findings paragraph arguing for {target_prediction}>",
-  "impression": "<one-sentence Impression arguing for {target_prediction}>"
-}}"""
-
-LABEL_FROM_RATIONALE_PROMPT_TEMPLATE = """\
-Based on the following radiology report assessment, what is the IDH mutation status?
-
-FINDINGS: {findings}
-
-IMPRESSION: {impression}
-
-Respond ONLY in the following JSON format (no extra text):
-{{
-  "idh_status": "IDH-mutant" | "IDH-wildtype",
-  "confidence": "high" | "medium" | "low"
-}}"""
-
-_VOCAB_PLACEHOLDER = "(feature list not provided)"
+import json
+from typing import Optional
 
 
-def build_prompt(
-    narrative: str,
-    feature_vocabulary: Optional[List[str]] = None,
-) -> tuple:
-    """Return (system_prompt, user_prompt) for the OpenAI messages API."""
-    vocab_str = (
-        "\n".join(f"  - {f}" for f in feature_vocabulary)
-        if feature_vocabulary
-        else _VOCAB_PLACEHOLDER
-    )
-    return SYSTEM_PROMPT, USER_PROMPT_TEMPLATE.format(
-        narrative=narrative,
-        feature_vocabulary=vocab_str,
-    )
+SYSTEM_PROMPT = (
+    "You are an experienced brain radiologist with medical expertise in "
+    "neuro-oncology, radiogenomics, and IDH genotyping."
+)
+
+USER_PROMPT_TEMPLATE = (
+    "You are an experienced radiologist entasked with discriminating a brain "
+    "glioma as either 'IDH mutant' or 'IDH wildtype'. You are presented a json "
+    "file encapsulating semantic (visual) attributes and quantitative metrics "
+    "about a brain tumor (glioma) - extracted from 3D multiparametric MRI "
+    "sequences (FLAIR, T1-contrast enhanced, and T2-weighted) and co-registered "
+    "3D segmentation map of tumor subregions. Note that we do not have "
+    "information on the necrosis component of the tumor. Provide a compact "
+    "response with compact reasoning."
+)
+
+
+def build_prompt(features_dict: dict, clinical_dict: Optional[dict] = None) -> tuple:
+    """Return (system_prompt, user_prompt) with features and optional clinical data."""
+    payload: dict = {}
+    if clinical_dict:
+        clinical_data = {}
+        for k, v in clinical_dict.items():
+            lower = k.lower().strip()
+            if lower in ("sex", "gender"):
+                clinical_data["gender"] = v
+            elif lower in ("age at mri", "age"):
+                clinical_data["age (years)"] = v
+        if clinical_data:
+            payload["clinical_data"] = clinical_data
+    payload.update(features_dict)
+    user_prompt = USER_PROMPT_TEMPLATE + f"\n\nHere is the json data:\n{json.dumps(payload, indent=4)}"
+    return SYSTEM_PROMPT, user_prompt
